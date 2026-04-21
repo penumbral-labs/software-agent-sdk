@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -13,7 +14,11 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SecretStr,
+    SerializationInfo,
+    ValidationInfo,
     field_serializer,
+    model_serializer,
     model_validator,
 )
 
@@ -34,7 +39,6 @@ from openhands.sdk.tool import (
 )
 from openhands.sdk.tool.builtins import InvokeSkillTool
 from openhands.sdk.utils.models import DiscriminatedUnionMixin
-from openhands.sdk.utils.redact import sanitize_config
 
 
 if TYPE_CHECKING:
@@ -43,6 +47,7 @@ if TYPE_CHECKING:
         ConversationCallbackType,
         ConversationTokenCallbackType,
     )
+    from openhands.sdk.utils.cipher import Cipher
 
 logger = get_logger(__name__)
 
@@ -182,14 +187,25 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
     @model_validator(mode="before")
     @classmethod
-    def _validate_system_prompt_fields(cls, data: Any) -> Any:
+    def _validate_and_decrypt(cls, data: Any, info: ValidationInfo) -> Any:
+        """Validate system prompt fields and decrypt mcp_config if needed.
+
+        Handles backward compatibility for mcp_config:
+        - If encrypted_mcp_config exists and cipher is present: decrypt it
+        - If mcp_config exists directly: use it as-is (plaintext or expose_secrets)
+        - If neither exists: default empty dict will be used
+        """
         if not isinstance(data, dict):
             return data
+
+        # Handle security_policy_filename
         if (
             "security_policy_filename" in data
             and data["security_policy_filename"] is None
         ):
             data["security_policy_filename"] = ""
+
+        # Validate system_prompt fields
         has_inline = data.get("system_prompt") is not None
         has_custom_filename = (
             "system_prompt_filename" in data
@@ -200,21 +216,118 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
                 "Cannot set both 'system_prompt' and a non-default "
                 "'system_prompt_filename'. Use one or the other."
             )
+
+        # Handle encrypted_mcp_config decryption
+        encrypted = data.pop("encrypted_mcp_config", None)
+        if encrypted is None:
+            return data
+
+        # If no cipher in context, we can't decrypt - the encrypted value is lost
+        if not info.context or not info.context.get("cipher"):
+            logger.warning(
+                "Found encrypted_mcp_config but no cipher in context - "
+                "MCP configuration will be lost. Provide a cipher to preserve it."
+            )
+            return data
+
+        from openhands.sdk.utils.cipher import Cipher
+
+        cipher: Cipher = info.context["cipher"]
+        decrypted = cipher.decrypt(encrypted)
+        if decrypted is None:
+            logger.warning(
+                "Failed to decrypt mcp_config (cipher mismatch or corruption) - "
+                "MCP configuration will be lost."
+            )
+            return data
+
+        try:
+            data["mcp_config"] = json.loads(decrypted.get_secret_value())
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse decrypted mcp_config as JSON: {e}")
+
         return data
 
-    @field_serializer("mcp_config")
-    @classmethod
-    def _serialize_mcp_config(cls, config: dict[str, Any]) -> dict[str, Any]:
-        """Redact sensitive fields from mcp_config during serialization.
+    @field_serializer("mcp_config", when_used="always")
+    def _serialize_mcp_config(
+        self, config: dict[str, Any], info: SerializationInfo
+    ) -> dict[str, Any] | None:
+        """Serialize mcp_config with encryption or redaction.
 
-        MCP config may contain expanded secrets in env vars, headers, and URLs.
-        This serializer uses sanitize_config() to redact those fields, keeping
-        the output shape stable while preventing secret leakage to disk,
-        WebSocket events, and API responses.
+        Follows the standard SDK secret handling pattern:
+        - If a cipher is provided in context: returns None (encryption handled
+          by model_serializer which stores encrypted_mcp_config)
+        - If expose_secrets flag is True in context: returns the config as-is
+        - Otherwise: returns None to redact sensitive MCP configuration
+
+        This ensures mcp_config secrets don't leak to API responses or WebSocket
+        events, while still allowing encrypted persistence for conversation resume.
         """
         if not config:
             return config
-        return sanitize_config(config)
+
+        # If cipher is present, we'll encrypt instead (handled in model_serializer)
+        if info.context and info.context.get("cipher"):
+            return None
+
+        # If expose_secrets is True, return the config as-is
+        if info.context and info.context.get("expose_secrets"):
+            return config
+
+        # Default: redact by returning None
+        return None
+
+    @model_serializer(mode="wrap")
+    def _serialize_with_encrypted_mcp(
+        self, handler: Any, info: SerializationInfo
+    ) -> dict[str, Any]:
+        """Serialize the agent, handling mcp_config encryption.
+
+        When a cipher is present in context and mcp_config has content:
+        - Encrypts mcp_config as JSON and stores in encrypted_mcp_config
+        - Removes the None mcp_config from output for cleaner serialization
+
+        This also handles polymorphic serialization for subclasses (like ACPAgent)
+        by delegating to model_dump when the handler is not for the actual class.
+        """
+        # Check if handler is for the current (actual) class
+        handler_str = str(handler)
+        if "=" in handler_str:
+            _, handler_class = handler_str.split("=", 1)
+            handler_class = handler_class.rstrip(")")
+        else:
+            handler_class = self.__class__.__name__
+
+        if handler_class != self.__class__.__name__:
+            # Handler is for a base class, delegate to model_dump for proper
+            # subclass serialization (e.g., ACPAgent fields)
+            result = self.model_dump(
+                mode=info.mode,
+                context=info.context,
+                by_alias=info.by_alias,
+                exclude_unset=info.exclude_unset,
+                exclude_defaults=info.exclude_defaults,
+                exclude_none=info.exclude_none,
+                round_trip=info.round_trip,
+                serialize_as_any=info.serialize_as_any,
+            )
+        else:
+            result = handler(self)
+
+        # Add encrypted_mcp_config if cipher is present and mcp_config has content
+        if self.mcp_config and info.context and info.context.get("cipher"):
+            from openhands.sdk.utils.cipher import Cipher
+
+            cipher: Cipher = info.context["cipher"]
+            json_str = json.dumps(self.mcp_config)
+            encrypted = cipher.encrypt(SecretStr(json_str))
+            if encrypted:
+                result["encrypted_mcp_config"] = encrypted
+            # Remove the None mcp_config if present (cleaner output)
+            if "mcp_config" in result and result["mcp_config"] is None:
+                del result["mcp_config"]
+
+        return result
 
     condenser: CondenserBase | None = Field(
         default=None,
