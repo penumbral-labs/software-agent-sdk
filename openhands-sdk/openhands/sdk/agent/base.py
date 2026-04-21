@@ -47,7 +47,6 @@ if TYPE_CHECKING:
         ConversationCallbackType,
         ConversationTokenCallbackType,
     )
-    from openhands.sdk.utils.cipher import Cipher
 
 logger = get_logger(__name__)
 
@@ -230,9 +229,7 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
             )
             return data
 
-        from openhands.sdk.utils.cipher import Cipher
-
-        cipher: Cipher = info.context["cipher"]
+        cipher = info.context["cipher"]
         decrypted = cipher.decrypt(encrypted)
         if decrypted is None:
             logger.warning(
@@ -316,9 +313,7 @@ class AgentBase(DiscriminatedUnionMixin, ABC):
 
         # Add encrypted_mcp_config if cipher is present and mcp_config has content
         if self.mcp_config and info.context and info.context.get("cipher"):
-            from openhands.sdk.utils.cipher import Cipher
-
-            cipher: Cipher = info.context["cipher"]
+            cipher = info.context["cipher"]
             json_str = json.dumps(self.mcp_config)
             encrypted = cipher.encrypt(SecretStr(json_str))
             if encrypted:
